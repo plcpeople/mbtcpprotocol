@@ -1,0 +1,10 @@
+.npmignore~
+mbtcp*.js~
+README.md~
+CHANGELOG.md~
+package.json~
+test*.js
+test*.js~
+npm-debug.log
+
+

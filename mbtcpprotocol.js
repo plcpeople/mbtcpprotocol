@@ -1158,6 +1158,12 @@ NodeMBTCP.prototype.writeResponse = function(data, foundSeqNum) {
 		if (typeof(self.writeDoneCallback === 'function')) {
 			self.writeDoneCallback(anyBadQualities);
 		}
+		if (self.resetPending) {
+			self.resetNow();
+		}
+		if (self.isoConnectionState === 0) {
+			self.connectNow(self.connectionParams, false);
+		}
 	}
 }
 
@@ -1239,10 +1245,18 @@ NodeMBTCP.prototype.readResponse = function(data, foundSeqNum) {
 		if (typeof(self.readDoneCallback === 'function')) {
 			self.readDoneCallback(anyBadQualities, dataObject);
 		}
-		if (self.resetPending) {
-			self.resetNow();
+		if (!self.writeInQueue) {
+			if (self.resetPending) {
+				self.resetNow();
+			}
+			if (self.isoConnectionState === 0) {
+				self.connectNow(self.connectionParams, false);
+			}
 		}
-		if (!self.isReading() && self.writeInQueue) { self.sendWritePacket(); }
+		if (!self.isReading() && self.writeInQueue) {
+			outputLog("SendWritePacket called because write was queued.");
+			self.sendWritePacket();
+		}
 	} else {
 		outputLog("Calling SRP from RR",1,self.connectionID);
 		self.sendReadPacket();
@@ -1259,8 +1273,8 @@ NodeMBTCP.prototype.onClientDisconnect = function() {
 NodeMBTCP.prototype.onClientClose = function() {
 	var self = this;
     // clean up the connection now the socket has closed
-	self.connectionCleanup();
-
+//	self.connectionCleanup();
+	self.connectionReset();  // We do a reset instead of a close now, as if close is somehow initiated at the other end we want to allow pending read/write to time out.
     // initiate the callback stored by dropConnection
     if (self.dropConnectionCallback) {
         self.dropConnectionCallback();
@@ -1276,10 +1290,10 @@ NodeMBTCP.prototype.connectionReset = function() {
 	self.isoConnectionState = 0;
 	self.resetPending = true;
 	outputLog('ConnectionReset is happening');
-	if (!self.isReading() && typeof(self.resetTimeout) === 'undefined') { // For now - ignore writes.  && !isWriting()) {
+	if (!self.isReading() && !self.isWriting() && !self.writeInQueue && typeof(self.resetTimeout) === 'undefined') {
 		self.resetTimeout = setTimeout(function() {
 			self.resetNow.apply(self, arguments);
-		} ,1500);
+		} ,4500);
 	}
 	// For now we wait until read() is called again to re-connect.
 }
@@ -1288,6 +1302,7 @@ NodeMBTCP.prototype.resetNow = function() {
 	var self = this;
 	self.isoConnectionState = 0;
 	self.isoclient.end();
+	self.isoclient.destroy();
 	outputLog('ResetNOW is happening');
 	self.resetPending = false;
 	// In some cases, we can have a timeout scheduled for a reset, but we don't want to call it again in that case.
@@ -1308,7 +1323,7 @@ NodeMBTCP.prototype.connectionCleanup = function() {
 		self.isoclient.removeAllListeners('error');
 		self.isoclient.removeAllListeners('connect');
 		self.isoclient.removeAllListeners('end');
-        self.isoclient.removeAllListeners('close');
+		self.isoclient.removeAllListeners('close');
 	}
 	clearTimeout(self.connectTimeout);
 	clearTimeout(self.PDUTimeout);

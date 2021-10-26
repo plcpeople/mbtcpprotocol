@@ -1,15 +1,15 @@
 {
   "name": "mbtcpprotocol",
   "description": "Routine to communicate with Modbus-TCP including symbol lookup, etc, for PLCs",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": {
-	"name": "Dana Moffit",
-	"email": "nodejsplc@gmail.com"
+    "name": "Dana Moffit",
+    "email": "nodejsplc@gmail.com"
   },
   "keywords": [
-	"Modbus",
-	"Modbus/TCP",
-	"PLC"
+    "Modbus",
+    "Modbus/TCP",
+    "PLC"
   ],
   "main": "mbtcpprotocol.js",
   "repository": {
@@ -17,7 +17,7 @@
     "url": "https://github.com/plcpeople/mbtcpprotocol"
   },
   "dependencies": {
-    "underscore": "1.4.x"
+    "underscore": "^1.13.1"
   },
   "engine": "node 0.8.x"
 }

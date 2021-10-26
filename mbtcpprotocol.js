@@ -1155,7 +1155,7 @@ NodeMBTCP.prototype.writeResponse = function(data, foundSeqNum) {
 			outputLog(self.globalWriteBlockList[i].addr + ' write completed with quality ' + self.globalWriteBlockList[i].writeQuality,0);
 			if (!isQualityOK(self.globalWriteBlockList[i].writeQuality)) { anyBadQualities = true; }
 		}
-		if (typeof(self.writeDoneCallback === 'function')) {
+		if (typeof(self.writeDoneCallback) === 'function') {
 			self.writeDoneCallback(anyBadQualities);
 		}
 		if (self.resetPending) {

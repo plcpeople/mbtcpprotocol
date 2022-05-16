@@ -4,7 +4,7 @@ var net = require("net");
 var _ = require("underscore");
 var util = require("util");
 var crc16 = require("./crc16");
-var effectiveDebugLevel = 1; // intentionally global, shared between connections
+var effectiveDebugLevel = 0; // intentionally global, shared between connections
 
 module.exports = NodeMBTCP;
 
@@ -12,10 +12,10 @@ function NodeMBTCP(){
 	var self = this;
 
 	// This header is used to assemble a read packet.
-	self.Header = new Buffer([0xff,0xff,0x00,0x00,0x00,0x00]);// followed by function and then data.  0,1 = trans ID, 2,3 = always 0, 4,5 = length, 6 = unit ID, 7=function, 8+=data
+	self.Header = Buffer.from([0xff,0xff,0x00,0x00,0x00,0x00]);// followed by function and then data.  0,1 = trans ID, 2,3 = always 0, 4,5 = length, 6 = unit ID, 7=function, 8+=data
 
-	self.readReq = new Buffer(1500);
-	self.writeReq = new Buffer(1500);
+	self.readReq = Buffer.alloc(1500);
+	self.writeReq = Buffer.alloc(1500);
 
 	self.resetPending = false;
 	self.resetTimeout = undefined;
@@ -35,6 +35,8 @@ function NodeMBTCP(){
 	self.connectTimeout = undefined;
 	self.PDUTimeout = undefined;
 	self.globalTimeout = 4500;
+	self.badReadCounter = 0;
+	self.badWriteCounter = 0;
 
 	self.readPacketArray = [];
 	self.writePacketArray = [];
@@ -55,12 +57,14 @@ function NodeMBTCP(){
 
 // EIP specific
 	self.sessionHandle = 0; // Define as zero for when we write packets prior to connection
+
+	self.defaultID = 1;
 }
 
 NodeMBTCP.prototype.setTranslationCB = function(cb) {
 	var self = this;
 	if (typeof cb === "function") {
-		outputLog('Translation OK');
+		outputLog('Translation OK',1,self.connectionID);
 		self.translationCB = cb;
 	}
 }
@@ -74,6 +78,9 @@ NodeMBTCP.prototype.initiateConnection = function (cParam, callback) {
 		self.connectionID = cParam.host;
 	} else {
 		self.connectionID = cParam.name;
+	}
+	if (typeof(cParam.defaultID) != 'undefined') {
+		self.defaultID = cParam.defaultID;
 	}
 	self.connectionParams = cParam;
 	self.connectCallback = callback;
@@ -123,7 +130,7 @@ NodeMBTCP.prototype.connectNow = function(cParam, suppressCallback) { // TODO - 
 		self.connectError.apply(self, arguments);
 	});
 
-	outputLog('<initiating a new connection>',1,self.connectionID);
+	outputLog('MODBUS <initiating a new connection ' + Date() + ' >',1,self.connectionID);
 	outputLog('Attempting to connect to host...',0,self.connectionID);
 }
 
@@ -162,11 +169,27 @@ NodeMBTCP.prototype.packetTimeout = function(packetType, packetSeqNum) {
 	} */
 	if (packetType === "read") {
 		outputLog("READ TIMEOUT on sequence number " + packetSeqNum,0,self.connectionID);
+		if (self.isoConnectionState === 4) { // Reset before calling readResponse so ResetNow will take place this cycle
+			outputLog("ConnectionReset from read packet timeout.", 0, self.connectionID);
+			self.badReadCounter += 1;
+			if (self.badReadCounter > (10+self.readPacketArray.length-1)) {
+				self.connectionReset();
+				self.badReadCounter = 0;
+			}
+		}
 		self.readResponse(undefined, self.findReadIndexOfSeqNum(packetSeqNum));
 		return undefined;
 	}
 	if (packetType === "write") {
 		outputLog("WRITE TIMEOUT on sequence number " + packetSeqNum,0,self.connectionID);
+		if (self.isoConnectionState === 4) { // Reset before calling writeResponse so ResetNow will take place this cycle
+			outputLog("ConnectionReset from write packet timeout.", 0, self.connectionID);
+			self.badWriteCounter += 1;
+			if (self.badWriteCounter > (10+self.writePacketArray.length-1)) {
+				self.connectionReset();
+				self.badWriteCounter = 0;
+			}
+		}
 		self.writeResponse(undefined, self.findWriteIndexOfSeqNum(packetSeqNum));
 		return undefined;
 	}
@@ -175,7 +198,7 @@ NodeMBTCP.prototype.packetTimeout = function(packetType, packetSeqNum) {
 
 NodeMBTCP.prototype.onTCPConnect = function() {
 	var self = this;
-	outputLog('TCP Connection Established to ' + self.isoclient.remoteAddress + ' on port ' + self.isoclient.remotePort,0,self.connectionID);
+	outputLog('MODBUS TCP Connection Established to ' + self.isoclient.remoteAddress + ' on port ' + self.isoclient.remotePort,0,self.connectionID);
 
 	// Track the connection state
 	self.isoConnectionState = 4;  // 4 = all connected, simple with Modbus
@@ -223,14 +246,14 @@ NodeMBTCP.prototype.writeItems = function(arg, value, cb) {
 	self.instantWriteBlockList = []; // Initialize the array.
 
 	if (typeof arg === "string") {
-		self.instantWriteBlockList.push(stringToMBAddr(self.translationCB(arg), arg));
+		self.instantWriteBlockList.push(stringToMBAddr(self.translationCB(arg), arg, self.defaultID, self.connectionID));
 		if (typeof(self.instantWriteBlockList[self.instantWriteBlockList.length - 1]) !== "undefined") {
 			self.instantWriteBlockList[self.instantWriteBlockList.length - 1].writeValue = value;
 		}
 	} else if (_.isArray(arg) && _.isArray(value) && (arg.length == value.length)) {
 		for (i = 0; i < arg.length; i++) {
 			if (typeof arg[i] === "string") {
-				self.instantWriteBlockList.push(stringToMBAddr(self.translationCB(arg[i]), arg[i]));
+				self.instantWriteBlockList.push(stringToMBAddr(self.translationCB(arg[i]), arg[i], self.defaultID, self.connectionID));
 				if (typeof(self.instantWriteBlockList[self.instantWriteBlockList.length - 1]) !== "undefined") {
 					self.instantWriteBlockList[self.instantWriteBlockList.length - 1].writeValue = value[i];
 				}
@@ -242,7 +265,7 @@ NodeMBTCP.prototype.writeItems = function(arg, value, cb) {
 	for (i=self.instantWriteBlockList.length-1;i>=0;i--) {
 		if (self.instantWriteBlockList[i] === undefined) {
 			self.instantWriteBlockList.splice(i,1);
-			outputLog("Dropping an undefined write item.");
+			outputLog("Dropping an undefined write item",0,self.connectionID);
 		}
 	}
 	self.prepareWritePacket();
@@ -273,11 +296,11 @@ NodeMBTCP.prototype.addItemsNow = function(arg) {
 	outputLog("Adding " + arg,0,self.connectionID);
 	addItemsFlag = false;
 	if (typeof arg === "string") {
-		self.polledReadBlockList.push(stringToMBAddr(self.translationCB(arg), arg));
+		self.polledReadBlockList.push(stringToMBAddr(self.translationCB(arg), arg, self.defaultID, self.connectionID));
 	} else if (_.isArray(arg)) {
 		for (i = 0; i < arg.length; i++) {
 			if (typeof arg[i] === "string") {
-				self.polledReadBlockList.push(stringToMBAddr(self.translationCB(arg[i]), arg[i]));
+				self.polledReadBlockList.push(stringToMBAddr(self.translationCB(arg[i]), arg[i], self.defaultID, self.connectionID));
 			}
 		}
 	}
@@ -286,7 +309,7 @@ NodeMBTCP.prototype.addItemsNow = function(arg) {
 	for (i=self.polledReadBlockList.length-1;i>=0;i--) {
 		if (self.polledReadBlockList[i] === undefined) {
 			self.polledReadBlockList.splice(i,1);
-			outputLog("Dropping an undefined request item.");
+			outputLog("Dropping an undefined request item.",0,self.connectionID);
 		}
 	}
 //	prepareReadPacket();
@@ -306,9 +329,9 @@ NodeMBTCP.prototype.removeItemsNow = function(arg) {
 		self.polledReadBlockList = [];
 	} else if (typeof arg === "string") {
 		for (i = 0; i < self.polledReadBlockList.length; i++) {
-			outputLog('TCBA ' + self.translationCB(arg));
+			outputLog('TCBA ' + self.translationCB(arg),0,self.connectionID);
 			if (self.polledReadBlockList[i].addr === self.translationCB(arg)) {
-				outputLog('Splicing');
+				outputLog('Splicing',1,self.connectionID);
 				self.polledReadBlockList.splice(i, 1);
 			}
 		}
@@ -343,7 +366,7 @@ NodeMBTCP.prototype.readAllItems = function(arg) {
 
 	// Check if ALL are done...  You might think we could look at parallel jobs, and for the most part we can, but if one just finished and we end up here before starting another, it's bad.
 	if (self.isWaiting()) {
-		outputLog("Waiting to read for all R/W operations to complete.  Will re-trigger readAllItems in 100ms.");
+		outputLog("Waiting to read for all R/W operations to complete.  Will re-trigger readAllItems in 100ms.",0,self.connectionID);
 		setTimeout(function() {
 			self.readAllItems.apply(self, arguments);
 		}, 100, arg);
@@ -456,7 +479,7 @@ NodeMBTCP.prototype.prepareWritePacket = function() {
 		self.globalWriteBlockList[i].isOptimized = false;
 		self.globalWriteBlockList[i].itemReference = [];
 		self.globalWriteBlockList[i].itemReference.push(itemList[i]);
-		bufferizeMBItem(itemList[i]);
+		bufferizeMBItem(itemList[i],self.connectionID);
 //		outputLog("Really Here");
 	}
 
@@ -549,7 +572,7 @@ NodeMBTCP.prototype.prepareWritePacket = function() {
 			self.writePacketArray[thisPacketNumber].itemList.push(requestList[i]);
 		}
 	}
-	outputLog("WPAL is " + self.writePacketArray.length, 1);
+	outputLog("WPAL is " + self.writePacketArray.length, 1,self.connectionID);
 }
 
 
@@ -606,7 +629,7 @@ NodeMBTCP.prototype.prepareReadPacket = function() {
 			self.globalReadBlockList[thisBlock].itemReference.push(itemList[i]);
 //			outputLog("Not optimizing.");
 		} else {
-			outputLog("Performing optimization of item " + itemList[i].addr + " with " + self.globalReadBlockList[thisBlock].addr,1);
+			outputLog("Performing optimization of item " + itemList[i].addr + " with " + self.globalReadBlockList[thisBlock].addr,1,self.connectionID);
 			// This next line checks the maximum.
 			// Think of this situation - we have a large request of 40 bytes starting at byte 10.
 			//	Then someone else wants one byte starting at byte 12.  The block length doesn't change.
@@ -633,7 +656,7 @@ NodeMBTCP.prototype.prepareReadPacket = function() {
 //	trial that did not work				(itemList[i].offset - self.globalReadBlockList[thisBlock].offset)*2 + (Math.ceil(itemList[i].byteLength/itemList[i].multidtypelen))*itemList[i].multidtypelen
 					);
 			}
-			outputLog("Optimized byte length is now " + self.globalReadBlockList[thisBlock].byteLength,1);
+			outputLog("Optimized byte length is now " + self.globalReadBlockList[thisBlock].byteLength,1,self.connectionID);
 
 //			globalReadBlockList[thisBlock].subelement = 0;  // We can't read just a timer preset, for example,
 
@@ -791,11 +814,11 @@ NodeMBTCP.prototype.sendReadPacket = function() {
 
 		// The FOR loop is left in here for now, but really we are only doing one request per packet for now.
 		for (j = 0; j < self.readPacketArray[i].itemList.length; j++) {
-			returnedBfr = MBAddrToBuffer(self.readPacketArray[i].itemList[j], false);
+			returnedBfr = MBAddrToBuffer(self.readPacketArray[i].itemList[j], false, self.connectionID);
 
-			outputLog('The Returned Modbus Buffer is:',2);
-			outputLog(returnedBfr, 2);
-			outputLog("The returned buffer length is " + returnedBfr.length, 2);
+			outputLog('The Returned Modbus Buffer is:',2,self.connectionID);
+			outputLog(returnedBfr,2,self.connectionID);
+			outputLog("The returned buffer length is " + returnedBfr.length,2,self.connectionID);
 
 			returnedBfr.copy(self.readReq, curLength);
 			curLength += returnedBfr.length;
@@ -812,8 +835,8 @@ NodeMBTCP.prototype.sendReadPacket = function() {
             curLength += 2;
         }
 
-		outputLog("The Returned buffer is:", 2);
-		outputLog(returnedBfr, 2);
+		outputLog("The Returned buffer is:",2,self.connectionID);
+		outputLog(returnedBfr,2,self.connectionID);
 
 		if (self.isoConnectionState == 4) {
 			self.readPacketArray[i].timeout = setTimeout(function(){
@@ -824,7 +847,7 @@ NodeMBTCP.prototype.sendReadPacket = function() {
 			self.readPacketArray[i].rcvd = false;
 			self.readPacketArray[i].timeoutError = false;
 			self.parallelJobsNow += 1;
-			outputLog('Sending Read Packet SEQ ' + self.readPacketArray[i].seqNum,1);
+			outputLog('Sending Read Packet SEQ ' + self.readPacketArray[i].seqNum,1,self.connectionID);
 		} else {
 //			outputLog('Somehow got into read block without proper isoConnectionState of 4.  Disconnect.');
 //			connectionReset();
@@ -861,7 +884,7 @@ NodeMBTCP.prototype.sendReadPacket = function() {
 NodeMBTCP.prototype.sendWritePacket = function() {
 	var self = this;
 	var dataBuffer, itemDataBuffer, dataBufferPointer, curLength, returnedBfr, flagReconnect = false;
-	dataBuffer = new Buffer(8192);
+	dataBuffer = Buffer.alloc(8192);
 
 	self.writeInQueue = false;
 
@@ -888,7 +911,7 @@ NodeMBTCP.prototype.sendWritePacket = function() {
 
 		dataBufferPointer = 0;
 		for (var j = 0; j < self.writePacketArray[i].itemList.length; j++) {
-			returnedBfr = MBAddrToBuffer(self.writePacketArray[i].itemList[j], true);
+			returnedBfr = MBAddrToBuffer(self.writePacketArray[i].itemList[j], true, self.connectionID);
 
 			outputLog(returnedBfr);
 			returnedBfr.copy(self.writeReq, curLength);
@@ -906,7 +929,7 @@ NodeMBTCP.prototype.sendWritePacket = function() {
             curLength += 2;
         }
 
-		outputLog("The returned buffer length is " + returnedBfr.length,1);
+		outputLog("The returned buffer length is " + returnedBfr.length,1,self.connectionID);
 
 		if (self.isoConnectionState === 4) {
 			self.writePacketArray[i].timeout = setTimeout(function() {
@@ -974,20 +997,20 @@ NodeMBTCP.prototype.onResponse = function(data) {
 
 	// NOT SO FAST - can't do this here.  If we time out, then later get the reply, we can't decrement this twice.  Or the CPU will not like us.  Do it if not rcvd.  parallelJobsNow--;
 
-	outputLog(data,2);  // Only log the entire buffer at high debug level
-	outputLog("onResponse called with length " + data.length,1);
+	outputLog(data,2,self.connectionID);  // Only log the entire buffer at high debug level
+	outputLog("onResponse called with length " + data.length,1,self.connectionID);
 
     if ((!self.connectionParams.RTU) && data.length < 9) {
-		outputLog('DATA LESS THAN 9 BYTES RECEIVED.  TOTAL CONNECTION RESET.');
-		outputLog(data);
+		outputLog('DATA LESS THAN 9 BYTES RECEIVED.  TOTAL CONNECTION RESET.',0,self.connectionID);
+		outputLog(data,0,self.connectionID);
 		self.connectionReset();
 //		setTimeout(connectNow, 2000, connectionParams);
 		return null;
 	}
 
     if ((!self.connectionParams.RTU) && (data.length < (data.readInt16BE(4) + 6))) {
-		outputLog('DATA LESS THAN MARKED LENGTH RECEIVED.  TOTAL CONNECTION RESET.');
-		outputLog(data);
+		outputLog('DATA LESS THAN MARKED LENGTH RECEIVED.  TOTAL CONNECTION RESET.',0,self.connectionID);
+		outputLog(data,0,self.connectionID);
 		self.connectionReset();
 //		setTimeout(connectNow, 2000, connectionParams);
 		return null;
@@ -995,9 +1018,9 @@ NodeMBTCP.prototype.onResponse = function(data) {
 
 	// The smallest read packet will pass a length check of 25.  For a 1-item write response with no data, length will be 22.
     if ((!self.connectionParams.RTU) && (data.length > (data.readInt16BE(4) + 6))) {
-		outputLog("An oversize packet was detected.  Excess length is " + (data.length - data.readInt16BE(4) - 6) + ".  ");
-		outputLog("Usually because two packets were sent at nearly the same time by the PLC.");
-		outputLog("We slice the buffer and schedule the second half for later processing.");
+		outputLog("An oversize packet was detected.  Excess length is " + (data.length - data.readInt16BE(4) - 6) + ".  ",0,self.connectionID);
+		outputLog("Usually because two packets were sent at nearly the same time by the PLC.",0,self.connectionID);
+		outputLog("We slice the buffer and schedule the second half for later processing.",0,self.connectionID);
 //		setTimeout(onResponse, 0, data.slice(data.readInt16BE(2) + 24));  // This re-triggers this same function with the sliced-up buffer.
 		process.nextTick(function(){
 			self.onResponse(data.slice(data.readInt16BE(4) + 6))
@@ -1008,8 +1031,8 @@ NodeMBTCP.prototype.onResponse = function(data) {
     if (self.connectionParams.RTU) {
         if (data.length < 6) {
             // Some functions may return less than this but looking at slave ID, function number, one word of data and CRC we should not see less than 6
-            outputLog('DATA LESS THAN 6 BYTES RECEIVED.  TOTAL CONNECTION RESET.');
-            outputLog(data);
+            outputLog('DATA LESS THAN 6 BYTES RECEIVED.  TOTAL CONNECTION RESET.',0,self.connectionID);
+            outputLog(data,0,self.connectionID);
             self.connectionReset();
             //		setTimeout(connectNow, 2000, connectionParams);
             return null;
@@ -1017,17 +1040,17 @@ NodeMBTCP.prototype.onResponse = function(data) {
 
         var crcIn = data.readUInt16LE(data.length - 2);
         if (crcIn !== crc16(data.slice(0, -2))) {
-            outputLog('CRC ERROR');
+            outputLog('CRC ERROR',0,self.connectionID);
             return null;
         }
     }
 
 
-	outputLog('Valid Modbus Response Received (not yet checked for error)', 1);
+	outputLog('Valid Modbus Response Received (not yet checked for error)',1,self.connectionID);
 
 	// Log the receive
-	outputLog('Received ' + data.length + ' bytes of data from PLC.', 1);
-	outputLog(data, 2);
+	outputLog('Received ' + data.length + ' bytes of data from PLC.',1,self.connectionID);
+	outputLog(data,2,self.connectionID);
 
 	// Check the sequence number
 	var foundSeqNum = undefined; // readPacketArray.length - 1;
@@ -1035,7 +1058,7 @@ NodeMBTCP.prototype.onResponse = function(data) {
 	var isReadResponse = false, isWriteResponse = false;
 
     if (!self.connectionParams.RTU) {
-	    outputLog("On Response - Sequence " + data.readUInt16BE(0), 1);
+	    outputLog("On Response - Sequence " + data.readUInt16BE(0),1,self.connectionID);
 
 	    foundSeqNum = self.findReadIndexOfSeqNum(data.readUInt16BE(0));
 
@@ -1052,7 +1075,7 @@ NodeMBTCP.prototype.onResponse = function(data) {
 		    }
 	    } else {
 		    isReadResponse = true;
-		    outputLog("Received Read Response - Array Offset Is " + foundSeqNum,1);
+		    outputLog("Received Read Response - Array Offset Is " + foundSeqNum,1,self.connectionID);
 	    }
     }
 
@@ -1073,8 +1096,8 @@ NodeMBTCP.prototype.onResponse = function(data) {
     }
 
 	if ((!isReadResponse) && (!isWriteResponse)) {
-		outputLog("Sequence number that arrived wasn't a write reply either - dropping");
-		outputLog(data);
+		outputLog("Sequence number that arrived wasn't a write reply either - dropping",0,self.connectionID);
+		outputLog(data,0,self.connectionID);
 // 	I guess this isn't a showstopper, just ignore it.
 //		connectionReset();
 //		setTimeout(connectNow, 2000, connectionParams);
@@ -1118,16 +1141,16 @@ NodeMBTCP.prototype.writeResponse = function(data, foundSeqNum) {
 	}
 
 	for (itemCount = 0; itemCount < self.writePacketArray[foundSeqNum].itemList.length; itemCount++) {
-		dataPointer = processMBWriteItem(data, self.writePacketArray[foundSeqNum].itemList[itemCount], dataPointer);
+		dataPointer = processMBWriteItem(data, self.writePacketArray[foundSeqNum].itemList[itemCount], dataPointer,self.connectionID);
 		if (!dataPointer) {
-			outputLog('Stopping Processing Write Response Packet due to unrecoverable packet error');
+			outputLog('Stopping Processing Write Response Packet due to unrecoverable packet error',0,self.connectionID);
 			break;
 		}
 	}
 
 	// Make a note of the time it took the PLC to process the request.
 	self.writePacketArray[foundSeqNum].reqTime = process.hrtime(self.writePacketArray[foundSeqNum].reqTime);
-	outputLog('Time is ' + self.writePacketArray[foundSeqNum].reqTime[0] + ' seconds and ' + Math.round(self.writePacketArray[foundSeqNum].reqTime[1]*10/1e6)/10 + ' ms.',1);
+	outputLog('Time is ' + self.writePacketArray[foundSeqNum].reqTime[0] + ' seconds and ' + Math.round(self.writePacketArray[foundSeqNum].reqTime[1]*10/1e6)/10 + ' ms.',1,self.connectionID);
 
 //	writePacketArray.splice(foundSeqNum, 1);
 	if (!self.writePacketArray[foundSeqNum].rcvd) {
@@ -1139,7 +1162,7 @@ NodeMBTCP.prototype.writeResponse = function(data, foundSeqNum) {
 	if (!self.writePacketArray.every(doneSending)) {
 //			readPacketInterval = setTimeout(prepareReadPacket, 3000);
 		self.sendWritePacket();
-		outputLog("Sending again",1);
+		outputLog("Sending again",1,self.connectionID);
 	} else {
 		for (i=0;i<self.writePacketArray.length;i++) {
 			self.writePacketArray[i].sent = false;
@@ -1152,7 +1175,7 @@ NodeMBTCP.prototype.writeResponse = function(data, foundSeqNum) {
 			// Post-process the write code and apply the quality.
 			// Loop through the global block list...
 			writePostProcess(self.globalWriteBlockList[i]);
-			outputLog(self.globalWriteBlockList[i].addr + ' write completed with quality ' + self.globalWriteBlockList[i].writeQuality,0);
+			outputLog(self.globalWriteBlockList[i].addr + ' write completed with quality ' + self.globalWriteBlockList[i].writeQuality,0,self.connectionID);
 			if (!isQualityOK(self.globalWriteBlockList[i].writeQuality)) { anyBadQualities = true; }
 		}
 		if (typeof(self.writeDoneCallback) === 'function') {
@@ -1185,10 +1208,10 @@ NodeMBTCP.prototype.readResponse = function(data, foundSeqNum) {
 	}
 
 	for (itemCount = 0; itemCount < self.readPacketArray[foundSeqNum].itemList.length; itemCount++) {
-		dataPointer = processMBPacket(data, self.readPacketArray[foundSeqNum].itemList[itemCount], dataPointer, self.connectionParams.RTU);
+		dataPointer = processMBPacket(data, self.readPacketArray[foundSeqNum].itemList[itemCount], dataPointer, self.connectionParams.RTU, self.connectionID);
 		if (!dataPointer && typeof(data) !== "undefined") {
 			// Don't bother showing this message on timeout.
-			outputLog('Received a ZERO RESPONSE Processing Read Packet due to unrecoverable packet error');
+			outputLog('Received a ZERO RESPONSE Processing Read Packet due to unrecoverable packet error',0,self.connectionID);
 //			break;  // We rely on this for our timeout now.
 		}
 	}
@@ -1228,7 +1251,7 @@ NodeMBTCP.prototype.readResponse = function(data, foundSeqNum) {
 			// For each ITEM reference pointed to by the block, we process the item.
 			for (var k=0;k<self.globalReadBlockList[i].itemReference.length;k++) {
 //				outputLog(self.globalReadBlockList[i].itemReference[k].byteBuffer);
-				processMBReadItem(self.globalReadBlockList[i].itemReference[k], self.connectionParams.RTU);
+				processMBReadItem(self.globalReadBlockList[i].itemReference[k], self.connectionParams.RTU, self.connectionID);
 				outputLog('Address ' + self.globalReadBlockList[i].itemReference[k].addr + ' has value ' + self.globalReadBlockList[i].itemReference[k].value + ' and quality ' + self.globalReadBlockList[i].itemReference[k].quality,1,self.connectionID);
 				if (!isQualityOK(self.globalReadBlockList[i].itemReference[k].quality)) {
 					anyBadQualities = true;
@@ -1254,7 +1277,7 @@ NodeMBTCP.prototype.readResponse = function(data, foundSeqNum) {
 			}
 		}
 		if (!self.isReading() && self.writeInQueue) {
-			outputLog("SendWritePacket called because write was queued.");
+			outputLog("SendWritePacket called because write was queued.",0,self.connectionID);
 			self.sendWritePacket();
 		}
 	} else {
@@ -1265,7 +1288,7 @@ NodeMBTCP.prototype.readResponse = function(data, foundSeqNum) {
 
 NodeMBTCP.prototype.onClientDisconnect = function() {
 	var self = this;
-	outputLog('EIP/TCP DISCONNECTED.');
+	outputLog('MODBUS/TCP DISCONNECTED.',0,self.connectionID);
 	self.connectionCleanup();
 	self.tryingToConnectNow = false;
 }
@@ -1289,9 +1312,10 @@ NodeMBTCP.prototype.connectionReset = function() {
 	var self = this;
 	self.isoConnectionState = 0;
 	self.resetPending = true;
-	outputLog('ConnectionReset is happening');
+	outputLog('ConnectionReset is happening',0,self.connectionID);
 	if (!self.isReading() && !self.isWriting() && !self.writeInQueue && typeof(self.resetTimeout) === 'undefined') {
 		self.resetTimeout = setTimeout(function() {
+			outputLog('Timed reset has happened. Ideally this would never be called as reset should be completed when done r/w.',0,self.connectionID);
 			self.resetNow.apply(self, arguments);
 		} ,4500);
 	}
@@ -1303,27 +1327,31 @@ NodeMBTCP.prototype.resetNow = function() {
 	self.isoConnectionState = 0;
 	self.isoclient.end();
 	self.isoclient.destroy();
-	outputLog('ResetNOW is happening');
+	outputLog('ResetNOW is happening',0,self.connectionID);
 	self.resetPending = false;
 	// In some cases, we can have a timeout scheduled for a reset, but we don't want to call it again in that case.
 	// We only want to call a reset just as we are returning values.  Otherwise, we will get asked to read // more values and we will "break our promise" to always return something when asked.
 	if (typeof(self.resetTimeout) !== 'undefined') {
 		clearTimeout(self.resetTimeout);
 		self.resetTimeout = undefined;
-		outputLog('Clearing an earlier scheduled reset');
+		outputLog('Clearing an earlier scheduled reset',0,self.connectionID);
 	}
 }
 
 NodeMBTCP.prototype.connectionCleanup = function() {
 	var self = this;
 	self.isoConnectionState = 0;
-	outputLog('Connection cleanup is happening');
+	outputLog('Connection cleanup is happening',0,self.connectionID);
 	if (typeof(self.isoclient) !== "undefined") {
+		self.isoclient.destroy();
 		self.isoclient.removeAllListeners('data');
 		self.isoclient.removeAllListeners('error');
 		self.isoclient.removeAllListeners('connect');
 		self.isoclient.removeAllListeners('end');
 		self.isoclient.removeAllListeners('close');
+		self.isoclient.on('error',function() {
+			outputLog('TCP socket error following connection cleanup',0,self.connectionID);
+		});
 	}
 	clearTimeout(self.connectTimeout);
 	clearTimeout(self.PDUTimeout);
@@ -1345,7 +1373,7 @@ function doneSending(element) {
 	return ((element.sent && element.rcvd) ? true : false);
 }
 
-function processMBPacket(theData, theItem, thePointer, RTU) {
+function processMBPacket(theData, theItem, thePointer, RTU, theCID) {
 	var remainingLength, headerAndPreamble;
 
 	if (typeof(theData) === "undefined") {
@@ -1358,17 +1386,17 @@ function processMBPacket(theData, theItem, thePointer, RTU) {
 	var prePointer = thePointer;
 
 	// Create a new buffer for the quality.
-	theItem.qualityBuffer = new Buffer(theItem.byteLength);
+	theItem.qualityBuffer = Buffer.alloc(theItem.byteLength);
 	theItem.qualityBuffer.fill(0xFF);  // Fill with 0xFF (255) which means NO QUALITY in the OPC world.
 
     if ((!(RTU) && (remainingLength < 9)) || (RTU && (remainingLength < 6)))  {
 		theItem.valid = false;
 		if (typeof(theData) !== "undefined") {
 			theItem.errCode = 'Malformed Modbus Packet - Less Than Minimum Bytes.  TDL' + theData.length + 'TP' + thePointer + 'RL' + remainingLength;
-			outputLog(theItem.errCode,0);  // Can't log more info here as we dont have "self" info
+			outputLog(theItem.errCode,0,theCID);
 		} else {
 			theItem.errCode = "Timeout error - zero length packet";
-			outputLog(theItem.errCode,1);  // Can't log more info here as we dont have "self" info
+			outputLog(theItem.errCode,1,theCID);
 		}
 		return 0;   			// Hard to increment the pointer so we call it a malformed packet and we're done.
 	}
@@ -1376,21 +1404,21 @@ function processMBPacket(theData, theItem, thePointer, RTU) {
     if (!(RTU) && (theData[2] !== 0x00 || theData[3] !== 0x00)) {
 		theItem.valid = false;
 		theItem.errCode = 'Invalid Modbus - Expected [2] to be 0x00 and [3] to be 0x00- got ' + theData[2] + ' and ' + theData[3];
-		outputLog(theItem.errCode);
+		outputLog(theItem.errCode,0,theCID);
 		return 1; //thePointer + reportedDataLength + 4;
 	}
 
     if (!(RTU) && (theData[7] > 0x7f)) {
 		theItem.valid = false;
 		theItem.errCode = 'Modbus Error Response - Function ' + theData[7] + ' (' + (theData[7] - 128) + ') and code ' + theData[8];
-		outputLog(theItem.errCode);
+		outputLog(theItem.errCode,0,theCID);
 		return 1; //thePointer + reportedDataLength + 4;
     }
 
     if ((RTU) && (theData[2] > 0x7f)) {
         theItem.valid = false;
         theItem.errCode = 'Modbus Error Response - Function ' + theData[2] + ' (' + (theData[2] - 128) + ') and code ' + theData[3];
-        outputLog(theItem.errCode);
+        outputLog(theItem.errCode,0,theCID);
         return 1; //thePointer + reportedDataLength + 4;
     }
 
@@ -1408,14 +1436,14 @@ function processMBPacket(theData, theItem, thePointer, RTU) {
 	if (theData.length - headerAndPreamble !== expectedLength) {
 		theItem.valid = false;
         theItem.errCode = 'Invalid Response Length - Expected ' + expectedLength + ' but got ' + (theData.length - headerAndPreamble) + ' bytes.';
-		outputLog(theItem.errCode);
+		outputLog(theItem.errCode,0,theCID);
 		return 1;
 	}
 
     if (!(RTU) && (theData.length - 6 !== theData.readUInt16BE(4))) {  // Already checked before getting here but check again to be sure.
 		theItem.valid = false;
 		theItem.errCode = 'Invalid Response Length From Header - Expected ' + theData.readUInt16BE(4) + ' but got ' + (theData.length - 8) + ' bytes.';
-		outputLog(theItem.errCode);
+		outputLog(theItem.errCode,0,theCID);
 		return 1;
 	}
 
@@ -1432,11 +1460,11 @@ function processMBPacket(theData, theItem, thePointer, RTU) {
         theItem.byteBuffer = theData.slice(3,theData.length-2); // This means take to end.
     }
 
-	outputLog('Byte Buffer is:',2);
-	outputLog(theItem.byteBuffer,2);
+	outputLog('Byte Buffer is:',2,theCID);
+	outputLog(theItem.byteBuffer,2,theCID);
 
 	theItem.qualityBuffer.fill(0xC0);  // Fill with 0xC0 (192) which means GOOD QUALITY in the OPC world.
-	outputLog('Marking quality as good L' + theItem.qualityBuffer.length,2);
+	outputLog('Marking quality as good L' + theItem.qualityBuffer.length,2,theCID);
 
 //	thePointer += theItem.byteLength; //WithFill;
 
@@ -1449,7 +1477,7 @@ function processMBPacket(theData, theItem, thePointer, RTU) {
 	return -1; //thePointer;
 }
 
-function processMBWriteItem(theData, theItem, thePointer) {
+function processMBWriteItem(theData, theItem, thePointer,theCID) {
 
 //	var remainingLength = theData.length - thePointer;  // Say if length is 39 and pointer is 35 we can access 35,36,37,38 = 4 bytes.
 //	var prePointer = thePointer;
@@ -1457,14 +1485,14 @@ function processMBWriteItem(theData, theItem, thePointer) {
 	if (typeof(theData) === 'undefined' || theData.length < 9) {  // Should be at least 11 bytes with 7 byte header
 		theItem.valid = false;
 		theItem.errCode = 'Malformed Reply Modbus Packet - Less Than 9 Bytes or Malformed Header.  ' + theData;
-		outputLog(theItem.errCode);
+		outputLog(theItem.errCode,0,theCID);
 		return 0;   			// Hard to increment the pointer so we call it a malformed packet and we're done.
 	}
 
 	var writeResponse = theData.readUInt8(7);
 
 	if (writeResponse > 0x7f) {
-		outputLog ('Received response ' + theData[7] + ' (' + (theData[7] - 128) + ') indicating write error of ' + theData[8] + ' on ' + theItem.addr);
+		outputLog ('Received response ' + theData[7] + ' (' + (theData[7] - 128) + ') indicating write error of ' + theData[8] + ' on ' + theItem.addr,0,theCID);
 		theItem.writeQualityBuffer.fill(0xFF);  // Note that ff is good in the S7 world but BAD in our fill here.
 	} else {
 		theItem.writeQualityBuffer.fill(0xC0);
@@ -1507,9 +1535,9 @@ function writePostProcess(theItem) {
 }
 
 
-function processMBReadItem(theItem, RTU) {
+function processMBReadItem(theItem, RTU, theCID) {
 
-	var thePointer = 0,tempBuffer = new Buffer(4);
+	var thePointer = 0,tempBuffer = Buffer.alloc(4);
 
 	if (theItem.arrayLength > 1) {
 		// Array value.
@@ -1587,7 +1615,7 @@ function processMBReadItem(theItem, RTU) {
 					break;
 
 				default:
-					outputLog("Unknown data type in response - should never happen.  Should have been caught earlier.  " + theItem.datatype);
+					outputLog("Unknown data type in response - should never happen.  Should have been caught earlier.  " + theItem.datatype,0,theCID);
 					return 0;
 				}
 			}
@@ -1617,10 +1645,10 @@ function processMBReadItem(theItem, RTU) {
 		if (theItem.qualityBuffer[thePointer] !== 0xC0) {
 			theItem.value = theItem.badValue();
 			theItem.quality = ('BAD ' + theItem.qualityBuffer[thePointer]);
-			outputLog("Item Quality is Bad", 1);
+			outputLog("Item Quality is Bad", 1, theCID);
 		} else {
 			theItem.quality = ('OK');
-			outputLog("Item Datatype (single value) is " + theItem.datatype + " and Byte Offset is " + theItem.byteOffset, 1);
+			outputLog("Item Datatype (single value) is " + theItem.datatype + " and Byte Offset is " + theItem.byteOffset, 1, theCID);
 			switch(theItem.datatype) {
 
 			case "REAL":
@@ -1676,7 +1704,7 @@ function processMBReadItem(theItem, RTU) {
 				theItem.value = theItem.byteBuffer.readInt16BE(thePointer + theItem.byteOffset);
 				break;
 			default:
-				outputLog("Unknown data type in response - should never happen.  Should have been caught earlier.  " + theItem.datatype);
+				outputLog("Unknown data type in response - should never happen.  Should have been caught earlier.  " + theItem.datatype, theCID);
 				return 0;
 			}
 		}
@@ -1691,7 +1719,7 @@ function processMBReadItem(theItem, RTU) {
 	return thePointer; // Should maybe return a value now???
 }
 
-function bufferizeMBItem(theItem) {
+function bufferizeMBItem(theItem, theCID) {
 	var thePointer, theByte;
 	theByte = 0;
 	thePointer = 0; // After length and header
@@ -1753,7 +1781,7 @@ function bufferizeMBItem(theItem) {
 					theItem.writeBuffer.writeInt16BE(theItem.writeValue[arrayIndex], thePointer);
 					break;
 				default:
-					outputLog("Unknown data type when preparing array write packet - should never happen.  Should have been caught earlier.  " + theItem.datatype);
+					outputLog("Unknown data type when preparing array write packet - should never happen.  Should have been caught earlier.  " + theItem.datatype, theCID);
 					return 0;
 			}
 			if (theItem.datatype == 'X' ) {
@@ -1807,7 +1835,7 @@ function bufferizeMBItem(theItem) {
 				break;
 			case "X":
 				theItem.writeBuffer.writeUInt8(((theItem.writeValue) ? 1 : 0), thePointer);  // checked ===true but this caused problems if you write 1
-				outputLog("Datatype is X writing " + theItem.writeValue + " tpi " + theItem.writeBuffer[0],1);
+				outputLog("Datatype is X writing " + theItem.writeValue + " tpi " + theItem.writeBuffer[0],1,theCID);
 
 // not here				theItem.writeBuffer[1] = 1; // Set transport code to "BIT" to write a single bit.
 // not here				theItem.writeBuffer.writeUInt16BE(1, 2); // Write only one bit.
@@ -1827,7 +1855,7 @@ function bufferizeMBItem(theItem) {
 				theItem.writeBuffer.writeInt16BE(theItem.writeValue, thePointer);
 				break;
 			default:
-				outputLog("Unknown data type in write prepare - should never happen.  Should have been caught earlier.  " + theItem.datatype);
+				outputLog("Unknown data type in write prepare - should never happen.  Should have been caught earlier.  " + theItem.datatype,theCID);
 				return 0;
 		}
 		thePointer += theItem.dtypelen;
@@ -1846,8 +1874,8 @@ function isQualityOK(obj) {
 	return true;
 }
 
-function MBAddrToBuffer(addrinfo, isWriting) { // SLCAddrToBufferA2
-	var writeLength, MBCommand = new Buffer(300);  // 12 is max length with all fields at max.
+function MBAddrToBuffer(addrinfo, isWriting, theCID) { // SLCAddrToBufferA2
+	var writeLength, MBCommand = Buffer.alloc(300);  // 12 is max length with all fields at max.
 
 	writeLength = isWriting ? (addrinfo.byteLength + 1) : 0; // Shouldn't ever be zero
 
@@ -1889,7 +1917,7 @@ function MBAddrToBuffer(addrinfo, isWriting) { // SLCAddrToBufferA2
 	return MBCommand.slice(0,6+writeLength); // WriteLength is the length we write.  writeLength - 1 is the data length.
 }
 
-function stringToMBAddr(addr, useraddr) {
+function stringToMBAddr(addr, useraddr, defaultID, theCID) {
 	// Modbus format overview
 	// Easier done by example
 	// MYTAG=1 = 0x00001 or very first coil
@@ -1908,7 +1936,7 @@ function stringToMBAddr(addr, useraddr) {
 	if (splitStringSlave.length > 1) {
 		theItem.slaveID = parseInt(splitStringSlave[1].replace(/[A-z]/gi, ''), 10);
 	} else {
-		theItem.slaveID = 255;
+		theItem.slaveID = defaultID;
 	}
 
 	// First check to see if we are looking for an array.
@@ -1937,17 +1965,29 @@ function stringToMBAddr(addr, useraddr) {
 //	outputLog('StartRegisterString[0] is ' + startRegisterString[0],2);
 
 	// Convert to integer
-	theItem.startRegister = parseInt(startRegisterString[0],10);
+	theItem.startRegister = parseInt(startRegisterString[0].replace(/[A-z]/gi, ''),10);
+
+	if (startRegisterString[0].search("RD") >= 0) {
+		theItem.startRegister += 40001;
+		if (splitString.length == 1) {
+			splitString.push("DINT");
+		}
+	} else if (startRegisterString[0].search("R") >= 0) {
+		theItem.startRegister += 40001;
+		if (splitString.length == 1) {
+			splitString.push("INT");
+		}
+	}
 
 	// Check the bit offset
 	if (startRegisterString.length > 2) {
-		outputLog("Error - You can only specify one bit offset");
+		outputLog("Error - You can only specify one bit offset",0,theCID);
 		return undefined;
 	}
 
 	// Do some checks on the startRegister to make sure it's sane.
 	if (theItem.startRegister <= 0 || theItem.startRegister == 10000 || theItem.startRegister == 100000 || (theItem.startRegister > 19999 && theItem.startRegister < 30001) || theItem.startRegister == 40000 || theItem.startRegister > 465535 || (theItem.startRegister > 365535 && theItem.startRegister < 400001)) {
-		outputLog("Error - Starting register  must be 1-9999, 10001-19999, 30001-39999, 40001-49999, 300001-365535, 400001-465535");
+		outputLog("Error - Starting register  must be 1-9999, 10001-19999, 30001-39999, 40001-49999, 300001-365535, 400001-465535",0,theCID);
 		return undefined;
 	}
 
@@ -1959,9 +1999,9 @@ function stringToMBAddr(addr, useraddr) {
 		theItem.datatype = undefined;
 	}
 
-	console.log('SRS');
-	console.log(startRegisterString);
-	console.log(theItem.datatype);
+	//console.log('SRS');
+	//console.log(startRegisterString);
+	//console.log(theItem.datatype);
 
 	// Process the bit offset
 	if (startRegisterString.length == 2) {
@@ -2006,12 +2046,12 @@ function stringToMBAddr(addr, useraddr) {
 			theItem.datatype = typeof(theItem.bitOffset) === 'undefined' ? "INT" : "X";
 		}
 	} else {
-		outputLog("Error - Register Not Valid");
+		outputLog("Error - Register Not Valid",0,theCID);
 		return undefined;
 	}
 
 	if (theItem.subtractor !== 30001 && theItem.subtractor !== 40001 && theItem.subtractor !== 300001 && theItem.subtractor !== 400001 && typeof(theItem.bitOffset) !== 'undefined') {
-		outputLog("Error - You can only specify bit offset with 3000x and 4000x registers");
+		outputLog("Error - You can only specify bit offset with 3000x and 4000x registers",0,theCID);
 		return undefined;
 	}
 
@@ -2039,7 +2079,7 @@ function stringToMBAddr(addr, useraddr) {
 			theItem.dtypelen = 4;  // in bytes
 			break;
 		default:
-			outputLog("Unknown data type entered - " + theItem.datatype);
+			outputLog("Unknown data type entered - " + theItem.datatype, theCID);
 			return undefined;
 		}
 	}
@@ -2132,13 +2172,13 @@ function PLCItem() { // Object
 	this.writeTransportCode = undefined;
 
 	// This is where the data can go that arrives in the packet, before calculating the value.
-	this.byteBuffer = new Buffer(8192);
-	this.writeBuffer = new Buffer(8192);
+	this.byteBuffer = Buffer.alloc(8192);
+	this.writeBuffer = Buffer.alloc(8192);
 
 	// We use the "quality buffer" to keep track of whether or not the requests were successful.
 	// Otherwise, it is too easy to lose track of arrays that may only be partially complete.
-	this.qualityBuffer = new Buffer(8192);
-	this.writeQualityBuffer = new Buffer(8192);
+	this.qualityBuffer = Buffer.alloc(8192);
+	this.writeQualityBuffer = Buffer.alloc(8192);
 
 	// Then we have item properties
 	this.value = undefined;
@@ -2217,7 +2257,7 @@ function doNothing(arg) {
 }
 
 function getFloat(buf, ptr, swap) {
-	var newBuf = new Buffer(4);
+	var newBuf = Buffer.alloc(4);
 	if (swap) {
 		newBuf[0] = buf[ptr+2];
 		newBuf[1] = buf[ptr+3];
@@ -2230,7 +2270,7 @@ function getFloat(buf, ptr, swap) {
 }
 
 function setFloat(buf, ptr, val, swap) {
-	var newBuf = new Buffer(4);
+	var newBuf = Buffer.alloc(4);
 	if (swap) {
 		newBuf.writeFloatBE(val, 0);
 		buf[ptr+2] = newBuf[0];
@@ -2245,7 +2285,7 @@ function setFloat(buf, ptr, val, swap) {
 }
 
 function getInt32(buf, ptr, swap) {
-	var newBuf = new Buffer(4);
+	var newBuf = Buffer.alloc(4);
 	if (swap) {
 		newBuf[0] = buf[ptr+2];
 		newBuf[1] = buf[ptr+3];
@@ -2258,7 +2298,7 @@ function getInt32(buf, ptr, swap) {
 }
 
 function setInt32(buf, ptr, val, swap) {
-	var newBuf = new Buffer(4);
+	var newBuf = Buffer.alloc(4);
 	if (swap) {
 		newBuf.writeInt32BE(Math.round(val), 0);
 		buf[ptr+2] = newBuf[0];
@@ -2274,7 +2314,7 @@ function setInt32(buf, ptr, val, swap) {
 
 
 function getUInt32(buf, ptr, swap) {
-	var newBuf = new Buffer(4);
+	var newBuf = Buffer.alloc(4);
 	if (swap) {
 		newBuf[0] = buf[ptr+2];
 		newBuf[1] = buf[ptr+3];
@@ -2287,7 +2327,7 @@ function getUInt32(buf, ptr, swap) {
 }
 
 function setUInt32(buf, ptr, val, swap) {
-	var newBuf = new Buffer(4);
+	var newBuf = Buffer.alloc(4);
 	if (swap) {
 		newBuf.writeUInt32BE(Math.round(val), 0);
 		buf[ptr+2] = newBuf[0];

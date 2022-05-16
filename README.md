@@ -1,17 +1,19 @@
 MBTCPPROTOCOL
 =============
 
-MBTCPPROTOCOL is a library that allows communication to PLCs and controllers using MODBUS/TCP.  
+MBTCPPROTOCOL is a library that allows communication to PLCs and controllers using MODBUS/TCP or MODBUS RTU over TCP.  
 
-It does not (yet) support Modbus Serial or a Modbus slave connected with a non-Modbus serial/Ethernet converter.
+It supports (in beta) a Modbus slave connected with a non-Modbus serial/Ethernet converter.  Use the RTU option.
 
 There is not yet support for double-precision floating point (64 bit) but this could be added with an appropriate test platform.
 
-IMPORTANT: You usually must specify the slave ID as part of the tag when the default of 255 is not good enough.
+IMPORTANT: You usually must specify the slave ID as part of the tag when the default of 1 is not good enough.
+
+IMPORTANT: The default ID up to and including version 0.1.12 is 255.  The default ID after that is 1, to mimic the old behavior, set defaultID: 255 in the connection parameters.
 
 Tag format supports the following:
-	TAG1=00001SLAVE1		// Leading zeros optional, 1-based "coils".  Read/write.  Always writes with "force multiple coils" FC15, never uses the single.  
-	TAG1=00001,100   		// Array of coils from slave 255.  Read/write.  
+	TAG1=00001SLAVE2		// Leading zeros optional, 1-based "coils".  Read/write.  Always writes with "force multiple coils" FC15, never uses the single.  
+	TAG1=00001,100   		// Array of coils from slave 1 (formerly 255).  Read/write.  
 	TAG1=10001   			// Input status.  Read-only.  
 	TAG1=10001,100  		// Input status array.  Read-only.  
 	TAG1=30001   			// Input register.  Read-only.  
@@ -27,11 +29,14 @@ Tag format supports the following:
 	TAG1=40001,100  		// Holding register array.  Read-only.  
 	TAG1=40001:REAL,100 	// Holding register array as REAL.  Assumes skip registers, like first is 40001, next is 40003, etc.  
 	TAG1=40001:WSREAL,100 	// Holding register array as word-swapped REAL.  Assumes skip registers, like first is 40001, next is 40003, etc.  
-	TAG1=40001:DINTSLAVE1	// Holding register as DINT, from slave 1
-	TAG1=40001:WSDINTSLAVE1	// Holding register as word-swapped DINT, from slave 1
+	TAG1=40001:DINTSLAVE2	// Holding register as DINT, from slave 1
+	TAG1=40001:WSDINTSLAVE2	// Holding register as word-swapped DINT, from slave 1
 	TAG1=40001:DWORD		// Holding register as unsigned DINT
 	TAG1=40001:WSDWORD		// Holding register as word-swapped unsigned DINT
 	TAG1=40001.3			// Holding register bit (IMPORTANT NOTE: read-only - can't write individual bits of 4000x registers)
+	TAG1=RD90				// Holding register 40091 as double integer
+	TAG1=R190				// Holding register 40191 as integer
+
 
 Installation:
 	
@@ -44,7 +49,7 @@ Example usage:
 	var doneReading = false;
 	var doneWriting = false;
 
-	conn.initiateConnection({port: 502, host: '192.168.8.199'}, connected);
+	conn.initiateConnection({port: 502, host: '192.168.8.199', defaultID: 1, RTU: false}, connected); // defaultID defaults to 1 and RTU defaults to false but shown here for illustration
 
 	function connected(err) {
 		if (typeof(err) !== "undefined") {
